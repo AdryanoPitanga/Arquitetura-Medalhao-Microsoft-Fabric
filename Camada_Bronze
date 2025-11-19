@@ -1,0 +1,261 @@
+import requests
+import json
+import os
+from pyspark.sql import SparkSession
+from datetime import datetime, timedelta
+from IPython.display import HTML
+
+
+spark = SparkSession.builder.getOrCreate()
+
+
+# ----------------------------
+# Funções auxiliares
+# ----------------------------
+
+
+def converter_para_api(data_ddmmaaaa):
+
+    dia, mes, ano = data_ddmmaaaa.split("/")
+
+    return f"{dia}{mes}{ano}"
+
+
+
+
+def gerar_datas(inicio, fim):
+
+    datas = []
+
+    d_inicio = datetime.strptime(inicio, "%d/%m/%Y")
+
+    d_fim = datetime.strptime(fim, "%d/%m/%Y")
+
+
+
+    d = d_inicio
+
+    while d <= d_fim:
+
+        datas.append(d.strftime("%d/%m/%Y"))
+
+        d += timedelta(days=1)
+
+
+
+    return datas
+
+
+
+
+# ----------------------------
+# Intervalo desejado
+# ----------------------------
+
+
+
+data_inicio = "01/01/2025"
+
+data_fim = "05/01/2025"
+
+
+
+lista_datas = gerar_datas(data_inicio, data_fim)
+
+registros = []
+
+
+# ----------------------------
+# LOCAL DE SALVAMENTO NO LAKEHOUSE
+# ----------------------------
+
+
+parquet_root = "Files/Voos/"          # <-- AGORA AQUI
+
+raw_root = "Files/Voos/raw_json/"     # opcional
+
+
+os.makedirs(raw_root, exist_ok=True)
+
+
+# ----------------------------
+# Ingestão
+# ----------------------------
+
+
+for data in lista_datas:
+
+    data_api = converter_para_api(data)
+
+    url = f"https://sas.anac.gov.br/sas/siros_api/voos?dataReferencia={data_api}"
+
+
+    print(f"\n📡 Consultando {data} → {url}")
+
+    resp = requests.get(url)
+
+    raw = resp.text
+
+
+    # data=YYYY-MM-DD
+
+    data_formatada = datetime.strptime(data, "%d/%m/%Y").strftime("%Y-%m-%d")
+
+
+    # ----------------------------
+    # Salvar JSON RAW (opcional)
+    # ----------------------------
+
+    pasta_raw = f"{raw_root}/data={data_formatada}/"
+
+    os.makedirs(pasta_raw, exist_ok=True)
+
+
+    with open(f"{pasta_raw}/voos_raw.json", "w", encoding="utf-8") as f:
+
+        f.write(raw)
+
+
+    print(f"💾 RAW salvo em: {pasta_raw}voos_raw.json")
+
+
+    # ----------------------------
+    # Normalizar JSON para DF
+    # ----------------------------
+
+    try:
+
+        dado = resp.json()
+
+        if isinstance(dado, str):
+
+            dado = json.loads(dado)
+
+
+        if isinstance(dado, list):
+
+            for r in dado:
+
+                r["data_consulta"] = data_formatada
+
+            registros.extend(dado)
+
+    except:
+
+        print(f"❌ JSON inválido em {data}")
+
+
+# ----------------------------
+# Criar DataFrame
+# ----------------------------
+
+
+
+df = spark.createDataFrame(registros)
+
+print(f"\n📊 Total de registros coletados: {df.count()}")
+
+
+# ----------------------------
+# SALVAR PARQUET (BRONZE)
+# ----------------------------
+
+
+
+(
+
+    df.write
+
+        .mode("overwrite")          # ou append
+
+        .format("parquet")
+
+        .partitionBy("data_consulta")    # ✓ partição por data
+
+        .save(parquet_root)
+
+)
+
+
+
+print("✅ PARQUET salvo em:")
+
+print(parquet_root)
+
+
+# ----------------------------
+# Display helper
+# ---------------------------
+
+
+def display(df, n=20):
+
+    pdf = df.limit(n).toPandas()
+
+    styled = (
+
+        pdf.style
+
+            .set_table_styles([
+
+                {
+
+                    "selector": "table",
+
+                    "props": [
+
+                        ("border", "2px solid #ccc"),
+
+                        ("border-collapse", "collapse"),
+
+                        ("font-family", "Arial"),
+
+                        ("font-size", "13px")
+
+                    ]
+
+                },
+
+                {
+
+                    "selector": "th",
+
+                    "props": [
+
+                        ("background-color", "#f2f2f2"),
+
+                        ("padding", "7px"),
+
+                        ("border", "2px solid #ccc")
+
+                    ]
+
+                },
+
+                {
+
+                    "selector": "td",
+
+                    "props": [
+
+                        ("padding", "7px"),
+
+                        ("border", "2px solid #ccc")
+
+                    ]
+
+                }
+
+            ])
+
+            .set_table_attributes('style="display:inline-block; overflow-x:auto; max-width:100%;"')
+
+    )
+
+
+
+    return HTML(styled.to_html())
+
+
+
+display(df)
